@@ -18,6 +18,9 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
   private isIngestingInFlight = false;
   private readonly POLL_INTERVAL_MS = 5000;
   private readonly MAX_LEDGER_RANGE = 100;
+  private readonly MAX_BACKOFF_MS = 5 * 60_000;
+  private backoffUntil = 0;
+  private consecutiveRpcFailures = 0;
   /** How many independent escrows to process in parallel per ingestion batch (#238). */
   private readonly eventProcessingConcurrency = config.EVENT_PROCESSING_CONCURRENCY;
 
@@ -47,20 +50,49 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
 
     const targetContract = contractId || getStellarConfig().contractId;
 
-    this.pollingInterval = setInterval(async () => {
-      try {
-        // Skip this tick if a previous ingestion is still in-flight (#408)
-        if (this.isIngestingInFlight) {
-          this.logger.debug('Previous ingestion still in-flight, skipping this polling tick');
-          return;
-        }
-        await this.ingestEvents(targetContract);
-      } catch (error) {
-        this.logger.error('Error during polling:', error);
-      }
-    }, this.POLL_INTERVAL_MS);
+    this.pollingInterval = setInterval(() => void this.pollTick(targetContract), this.POLL_INTERVAL_MS);
 
     await this.ingestEvents(targetContract);
+  }
+
+  private async pollTick(targetContract: string): Promise<void> {
+    try {
+      // Skip this tick if a previous ingestion is still in-flight (#408)
+      if (this.isIngestingInFlight) {
+        this.logger.debug('Previous ingestion still in-flight, skipping this polling tick');
+        return;
+      }
+      // Skip this tick while backing off from an RPC rate limit (#862)
+      if (Date.now() < this.backoffUntil) return;
+      await this.ingestEvents(targetContract);
+      this.consecutiveRpcFailures = 0;
+    } catch (error) {
+      if (!this.applyRpcBackoff(error)) {
+        this.logger.error('Error during polling:', error);
+      }
+    }
+  }
+
+  /**
+   * On a 429 or 5xx from the RPC node, pause polling — honoring `Retry-After` when present,
+   * otherwise doubling from the poll interval up to MAX_BACKOFF_MS (#862). Returns false for
+   * any other error so it is logged as before.
+   */
+  private applyRpcBackoff(error: unknown): boolean {
+    const response = (error as { response?: { status?: number; headers?: Record<string, unknown> } })
+      ?.response;
+    const status = response?.status;
+    if (status === undefined || (status !== 429 && status < 500)) return false;
+
+    this.consecutiveRpcFailures++;
+    const retryAfterSeconds = Number(response?.headers?.['retry-after']);
+    const delayMs =
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? retryAfterSeconds * 1000
+        : Math.min(this.POLL_INTERVAL_MS * 2 ** this.consecutiveRpcFailures, this.MAX_BACKOFF_MS);
+    this.backoffUntil = Date.now() + delayMs;
+    this.logger.warn(`Soroban RPC returned ${status}; backing off polling for ${delayMs}ms`);
+    return true;
   }
 
   stopPolling(): void {
@@ -88,7 +120,11 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
 
       let startLedger: number;
       if (checkpoint) {
-        startLedger = checkpoint.lastProcessedLedger + 1;
+        // When the cursor records the last event id, re-read that ledger so later events in
+        // the same ledger are not skipped; already-seen ids are filtered out below (#860).
+        startLedger = checkpoint.lastEventId
+          ? checkpoint.lastProcessedLedger
+          : checkpoint.lastProcessedLedger + 1;
         if (startLedger < oldestLedger) {
           this.logger.warn(
             `Cursor ${startLedger} is behind oldest available ledger ${oldestLedger}. Fast-forwarding.`,
@@ -118,11 +154,20 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
 
       this.logger.log(`Ingesting events from ledger ${startLedger} to ${endLedger}`);
 
-      const events = await this.fetchEvents(contractId, startLedger, endLedger);
+      const lastEventId = checkpoint?.lastEventId;
+      const lastLedger = checkpoint?.lastProcessedLedger;
+      const events = (await this.fetchEvents(contractId, startLedger, endLedger))
+        .sort((a, b) => a.ledger - b.ledger || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .filter(e => !(lastEventId && e.ledger === lastLedger && e.id <= lastEventId));
+
+      if (events.length === 0 && checkpoint && endLedger <= checkpoint.lastProcessedLedger) {
+        return [];
+      }
+
       const processedEvents = await this.processEventBatch(events);
 
-      const latestProcessedLedger =
-        events.length > 0 ? events[events.length - 1].ledger : endLedger;
+      const lastEvent = events.length > 0 ? events[events.length - 1] : undefined;
+      const latestProcessedLedger = lastEvent ? lastEvent.ledger : endLedger;
       const networkHash = await this.getNetworkHash();
 
       await this.ledgerCursorService.updateCursor(
@@ -130,6 +175,7 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
         latestProcessedLedger,
         `${startLedger}-${endLedger}`,
         networkHash,
+        lastEvent?.id,
       );
 
       return processedEvents;
@@ -277,7 +323,13 @@ export class EventIngestionService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      return allEvents.filter(e => e.ledger >= startLedger && e.ledger <= endLedger);
+      // Drop events re-delivered by an overlapping page, e.g. after an RPC failover mid-poll (#861)
+      const seen = new Set<string>();
+      return allEvents.filter(e => {
+        if (e.ledger < startLedger || e.ledger > endLedger || seen.has(e.id)) return false;
+        seen.add(e.id);
+        return true;
+      });
     } catch (error) {
       this.logger.error(`Failed to fetch events for ledgers ${startLedger}-${endLedger}:`, error);
       throw error;

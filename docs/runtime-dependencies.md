@@ -54,6 +54,10 @@ This document describes each external dependency the TrustFlow backend can use, 
 **Production Requirement:**
 - **REQUIRED**. Redis is mandatory for rate limiting, coordinating distributed sweeps, and ensuring escrow state consistency across instances. A single-instance deployment still requires Redis; without it, there is no anti-abuse protection and escrow state is not durable.
 
+**Outbox retention and the ingestion cursor (#863):**
+- `EventIngestionService`'s cursor lives under `ledger_cursor:<contractId>` (`LedgerCursorService`) and the processed-event dedup log under `processed-event:*` (`EventProcessorService`). Neither is derived from outbox rows, so purging delivered outbox events (`purgeDeliveredOutboxMessages`, or deleting `outbox:*` keys by hand) does not move the cursor and does not cause events to be re-ingested.
+- Do **not** delete `ledger_cursor:*` or `processed-event:*` keys as part of outbox cleanup. Deleting the cursor restarts ingestion from `SOROBAN_START_LEDGER` (or latest − 1000); deleting the dedup log as well means those re-read events are applied again.
+
 ---
 
 ### PostgreSQL

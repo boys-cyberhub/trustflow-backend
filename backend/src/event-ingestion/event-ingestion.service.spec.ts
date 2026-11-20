@@ -186,6 +186,90 @@ describe('EventIngestionService', () => {
     });
   });
 
+  describe('cursor, dedup and backoff (#860, #861, #862)', () => {
+    const event = (id: string, ledger: number) =>
+      ({ id, ledger, contractId: 'c', eventType: 'unknown', topic: [], value: {}, xdr: '', createdAt: new Date() }) as any;
+
+    beforeEach(() => {
+      (service as unknown as { rpcServer: SorobanRpc.Server }).rpcServer = {
+        getHealth: jest.fn().mockResolvedValue({ latestLedger: 100, oldestLedger: 1 }),
+        getNetwork: jest.fn().mockResolvedValue({ passphrase: 'net' }),
+        getEvents: jest.fn(),
+      } as unknown as SorobanRpc.Server;
+    });
+
+    it('ingests a later event in the same ledger as the previous cursor exactly once (#860)', async () => {
+      await ledgerCursorService.updateCursor('c', 100, 'x', 'net', '0000000100-0000000001');
+      const fetchSpy = jest
+        .spyOn(service as any, 'fetchEvents')
+        .mockResolvedValue([event('0000000100-0000000002', 100), event('0000000100-0000000001', 100)]);
+      const processSpy = jest
+        .spyOn(eventProcessorService, 'processEvent')
+        .mockImplementation(async e => ({ eventId: e.id, ledger: e.ledger, success: true, processedAt: new Date() }));
+
+      await service.ingestEvents('c');
+
+      expect(fetchSpy).toHaveBeenCalledWith('c', 100, 100);
+      expect(processSpy).toHaveBeenCalledTimes(1);
+      expect(processSpy.mock.calls[0][0].id).toBe('0000000100-0000000002');
+      expect((await ledgerCursorService.getCursor('c'))?.lastEventId).toBe('0000000100-0000000002');
+
+      // A further poll with nothing new neither re-processes nor rewinds the cursor.
+      processSpy.mockClear();
+      await service.ingestEvents('c');
+      expect(processSpy).not.toHaveBeenCalled();
+      expect((await ledgerCursorService.getCursor('c'))?.lastEventId).toBe('0000000100-0000000002');
+    });
+
+    it('drops events re-delivered by an overlapping page after an RPC failover (#861)', async () => {
+      const raw = (i: number) => ({
+        id: `0000000100-${String(i).padStart(10, '0')}`,
+        ledger: 100,
+        contractId: 'c',
+        topic: [],
+        value: { toXDR: () => Buffer.from('v') },
+      });
+      const page = Array.from({ length: 100 }, (_, i) => raw(i));
+      (service['rpcServer'].getEvents as jest.Mock)
+        .mockResolvedValueOnce({ events: page, cursor: 'p1' })
+        .mockResolvedValueOnce({ events: [...page.slice(40), raw(100)], cursor: undefined });
+
+      const result = await service['fetchEvents']('c', 100, 100);
+
+      expect(result).toHaveLength(101);
+      expect(new Set(result.map(e => e.id)).size).toBe(101);
+    });
+
+    it('backs off on a 429, honoring Retry-After, and skips ticks until it elapses (#862)', async () => {
+      const ingestSpy = jest
+        .spyOn(service, 'ingestEvents')
+        .mockRejectedValueOnce({ response: { status: 429, headers: { 'retry-after': '30' } } });
+
+      const before = Date.now();
+      await service['pollTick']('c');
+      expect(service['backoffUntil']).toBeGreaterThanOrEqual(before + 30_000);
+
+      ingestSpy.mockResolvedValue([]);
+      await service['pollTick']('c');
+      expect(ingestSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('backs off exponentially on repeated 429s without Retry-After, capped (#862)', () => {
+      const err = { response: { status: 429, headers: {} } };
+      const delays = Array.from({ length: 8 }, () => {
+        const before = Date.now();
+        service['applyRpcBackoff'](err);
+        return service['backoffUntil'] - before;
+      });
+      expect(delays[0]).toBeGreaterThanOrEqual(10_000);
+      expect(delays[1]).toBeGreaterThanOrEqual(20_000);
+      expect(delays[2]).toBeGreaterThanOrEqual(40_000);
+      expect(delays[7]).toBeGreaterThanOrEqual(5 * 60_000);
+      expect(delays[7]).toBeLessThanOrEqual(5 * 60_000 + 50);
+      expect(service['applyRpcBackoff'](new Error('boom'))).toBe(false);
+    });
+  });
+
   describe('retryFailedEvents', () => {
     it('should retry failed events with original event data', async () => {
       const originalEvent = {

@@ -11,6 +11,8 @@ export interface LedgerCheckpoint {
   cursorPosition: string;
   updatedAt: Date;
   networkHash: string;
+  /** Id of the last event processed in `lastProcessedLedger` (#860). */
+  lastEventId?: string;
 }
 
 const CURSOR_KEY_PREFIX = 'ledger_cursor:';
@@ -74,12 +76,18 @@ export class LedgerCursorService implements OnModuleInit {
     ledgerSequence: number,
     cursorPosition: string,
     networkHash: string,
+    lastEventId?: string,
   ): Promise<void> {
     const key = this.cursorKey(contractId);
 
-    // Ensure cursor updates are monotonic — never move backward (#408)
+    // Ensure cursor updates are monotonic — never move backward (#408). Within the same
+    // ledger, only a later event id advances it (#860).
     const existing = await this.getCursor(contractId);
-    if (existing && existing.lastProcessedLedger >= ledgerSequence) {
+    const sameLedgerAdvance =
+      existing?.lastProcessedLedger === ledgerSequence &&
+      lastEventId !== undefined &&
+      (existing.lastEventId === undefined || lastEventId > existing.lastEventId);
+    if (existing && existing.lastProcessedLedger >= ledgerSequence && !sameLedgerAdvance) {
       this.logger.warn(
         `Ignoring cursor update for contract ${contractId}: ` +
           `existing ledger ${existing.lastProcessedLedger} >= new ledger ${ledgerSequence}`,
@@ -93,6 +101,7 @@ export class LedgerCursorService implements OnModuleInit {
       cursorPosition,
       updatedAt: new Date(),
       networkHash,
+      ...(lastEventId !== undefined ? { lastEventId } : {}),
     };
 
     if (this.redis) {

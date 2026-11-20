@@ -3,7 +3,12 @@ import * as net from 'net';
 import * as crypto from 'crypto';
 import { AddressInfo } from 'net';
 import { Test, TestingModule } from '@nestjs/testing';
-import { WebhookService, computeWebhookSignature } from './webhook.service';
+import {
+  WebhookService,
+  computeWebhookSignature,
+  isPrivateIP,
+  validateWebhookUrl,
+} from './webhook.service';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -68,13 +73,17 @@ describe('WebhookService', () => {
       const secret = 'test-secret-key-123456';
       const payload =
         '{"event":"escrow.created","data":{"id":"esc-1"},"timestamp":"2026-08-31T00:00:00.000Z"}';
-      const expected = crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+      const ts = 1_780_000_000_000;
+      const expected = crypto
+        .createHmac('sha256', secret)
+        .update(`${ts}.${payload}`, 'utf8')
+        .digest('hex');
 
-      const signature = computeWebhookSignature(payload, secret);
+      const signature = computeWebhookSignature(payload, secret, ts);
 
-      expect(signature).toBe(expected);
-      expect(signature).toHaveLength(64); // 32-byte SHA-256 = 64 hex chars
-      expect(signature).toMatch(/^[0-9a-f]{64}$/);
+      // #856: the v1 value is lowercase hex (32-byte SHA-256 = 64 hex chars), not base64.
+      expect(signature).toBe(`t=${ts},v1=${expected}`);
+      expect(signature).toMatch(/^t=\d+,v1=[0-9a-f]{64}$/);
     });
 
     it('produces different signatures for different secrets or payloads', () => {
@@ -85,6 +94,29 @@ describe('WebhookService', () => {
 
       expect(sig1).not.toBe(sig2);
       expect(sig1).not.toBe(sig3);
+    });
+  });
+
+  // ─── SSRF target validation (#859) ──────────────────────────────────────
+
+  describe('validateWebhookUrl() — internal targets (#859)', () => {
+    it.each([
+      'http://169.254.169.254/latest/meta-data/',
+      'http://localhost:8080/hook',
+      'http://127.0.0.1:3000/hook',
+      'http://10.0.0.5/hook',
+      'http://[::1]:3000/hook',
+      'http://[::ffff:127.0.0.1]/hook',
+      'http://[::ffff:169.254.169.254]/hook',
+      'http://[fd00::1]/hook',
+    ])('rejects %s', async url => {
+      await expect(validateWebhookUrl(url)).rejects.toThrow(/not allowed|private/);
+    });
+
+    it('treats hex-form IPv4-mapped IPv6 addresses as their IPv4 equivalent', () => {
+      expect(isPrivateIP('::ffff:7f00:1')).toBe(true); // 127.0.0.1
+      expect(isPrivateIP('::ffff:a9fe:a9fe')).toBe(true); // 169.254.169.254
+      expect(isPrivateIP('::ffff:808:808')).toBe(false); // 8.8.8.8
     });
   });
 

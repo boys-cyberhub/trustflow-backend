@@ -5,6 +5,25 @@ import { config } from '../config/env.config';
 import { MetricsService } from '../monitoring/metrics.service';
 import { withRetry, isRetryable } from './retry.helper';
 
+/**
+ * Formats an XLM decimal string for display, rounded half-up to Stellar's
+ * 7-decimal precision with trailing zeros dropped (#858). Uses string/BigInt
+ * arithmetic so long fractions never go through float conversion. Values that
+ * aren't plain decimals are returned unchanged.
+ */
+export function formatXlmAmount(amount: string | number): string {
+  const raw = String(amount ?? '').trim();
+  const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(raw);
+  if (!m) return raw;
+  const [, sign, int, frac = ''] = m;
+  if (frac.length <= 7) return frac ? `${sign}${int}.${frac}` : `${sign}${int}`;
+  let scaled = BigInt(int + frac.slice(0, 7));
+  if (Number(frac[7]) >= 5) scaled += BigInt(1);
+  const digits = scaled.toString().padStart(8, '0');
+  const out = `${digits.slice(0, -7)}.${digits.slice(-7)}`.replace(/\.?0+$/, '');
+  return `${sign}${out}`;
+}
+
 interface DiscordEmbed {
   title: string;
   description: string;
@@ -56,7 +75,7 @@ export class DiscordService {
       color: 0xff6b6b, // Red color
       fields: [
         { name: 'Escrow ID', value: disputeData.escrowId, inline: true },
-        { name: 'Amount', value: `${disputeData.amountXLM} XLM`, inline: true },
+        { name: 'Amount', value: `${formatXlmAmount(disputeData.amountXLM)} XLM`, inline: true },
         { name: 'Depositor', value: this.truncateAddress(disputeData.depositor), inline: true },
         { name: 'Beneficiary', value: this.truncateAddress(disputeData.beneficiary), inline: true },
       ],

@@ -16,7 +16,9 @@ export async function withRetry<T>(
       lastError = err;
       if (!shouldRetry(err)) break;
       if (attempt < maxAttempts) {
-        await new Promise(r => setTimeout(r, baseDelayMs * attempt));
+        // Exponential backoff (base, 2×, 4×, …) capped at 30 s (#857).
+        const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), 30_000);
+        await new Promise(r => setTimeout(r, delayMs));
       }
     }
   }

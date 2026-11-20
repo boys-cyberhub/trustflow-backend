@@ -45,7 +45,7 @@ describe('withRetry()', () => {
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
-  it('uses linear backoff: delay grows as baseDelayMs × attempt', async () => {
+  it('uses exponential backoff: delay doubles per attempt (#857)', async () => {
     const delays: number[] = [];
     const originalSetTimeout = global.setTimeout;
 
@@ -61,14 +61,13 @@ describe('withRetry()', () => {
       .fn()
       .mockRejectedValueOnce(new Error('fail-1'))
       .mockRejectedValueOnce(new Error('fail-2'))
+      .mockRejectedValueOnce(new Error('fail-3'))
       .mockResolvedValue('ok');
 
-    await withRetry(fn, 3, 100);
+    await withRetry(fn, 4, 100);
 
-    // Attempt 1 fails → delay 100 * 1 = 100ms
-    // Attempt 2 fails → delay 100 * 2 = 200ms
-    // Attempt 3 succeeds → no delay
-    expect(delays).toEqual([100, 200]);
+    // Attempts 1–3 fail → delays 100, 200, 400ms; attempt 4 succeeds → no delay
+    expect(delays).toEqual([100, 200, 400]);
 
     jest.restoreAllMocks();
   });

@@ -2,7 +2,7 @@ import * as http from 'http';
 import * as net from 'net';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AddressInfo } from 'net';
-import { DiscordService } from './discord.service';
+import { DiscordService, formatXlmAmount } from './discord.service';
 
 describe('DiscordService', () => {
   let service: DiscordService;
@@ -124,5 +124,22 @@ describe('DiscordService', () => {
 
       await new Promise<void>(res => silentServer.close(() => res()));
     }, 30_000);
+  });
+
+  describe('formatXlmAmount (#858)', () => {
+    it.each([
+      ['100', '100'],
+      ['12.3456789', '12.3456789'],
+      ['12.34567891234', '12.3456789'],
+      ['0.00000005', '0.0000001'],
+      ['1.99999999', '2'],
+      ['-3.123456789', '-3.1234568'],
+    ])('formats %s as %s', (input, expected) => {
+      expect(formatXlmAmount(input)).toBe(expected);
+    });
+
+    it('returns non-decimal input unchanged instead of NaN', () => {
+      expect(formatXlmAmount('not-a-number')).toBe('not-a-number');
+    });
   });
 });

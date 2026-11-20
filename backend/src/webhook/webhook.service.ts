@@ -11,7 +11,7 @@ import { OutboxService } from '../outbox/outbox.service';
 import { forwardRef, Inject } from '@nestjs/common';
 import { config } from '../config/env.config';
 
-/** Base backoff between webhook delivery attempts; grows linearly per attempt. */
+/** Base backoff between webhook delivery attempts; doubles per attempt. */
 const WEBHOOK_RETRY_BASE_DELAY_MS = 1000;
 
 /**
@@ -133,6 +133,14 @@ export function isPrivateIP(ip: string): boolean {
     }
     // ::ffff:127.0.0.1 already handled via dot check but also explicit
     if (lower === '::ffff:127.0.0.1') return true;
+    // IPv4-mapped IPv6 in the hex form URL parsing normalises to, e.g.
+    // ::ffff:7f00:1 for ::ffff:127.0.0.1 (#859).
+    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+    if (mapped) {
+      const hi = parseInt(mapped[1], 16);
+      const lo = parseInt(mapped[2], 16);
+      return isPrivateIP(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
     return false;
   }
   return false;
@@ -195,7 +203,8 @@ export async function validateWebhookUrl(urlString: string): Promise<void> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new BadRequestException('Webhook URL must use http or https');
   }
-  const hostname = url.hostname;
+  // URL keeps IPv6 literals bracketed ("[::1]"), which net.isIP() rejects (#859).
+  const hostname = url.hostname.replace(/^\[(.*)\]$/, '$1');
   if (!hostname) throw new BadRequestException('Webhook URL must have a hostname');
   if (isPrivateIP(hostname)) {
     throw new BadRequestException(
